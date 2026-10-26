@@ -1,0 +1,164 @@
+name: Reusable OSGi PDE Build
+
+on:
+  workflow_call:
+    inputs:
+      scenario:
+        description: "Build all products (full) or only changed products and their dependents (changed)"
+        type: string
+        required: false
+        default: changed
+      publish_to_jfrog:
+        description: "Upload built OSGi JARs and publish JFrog build-info"
+        type: boolean
+        required: false
+        default: false
+      runner:
+        description: "JSON array of runner labels, e.g. [\"ubuntu-latest\"]"
+        type: string
+        required: false
+        default: '["ubuntu-latest"]'
+    secrets:
+      JF_ACCESS_TOKEN:
+        required: false
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  pde-build:
+    name: Plan, secure, build and package OSGi features
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: 60
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js for dependency planning
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+
+      - name: Resolve build scenario and Git comparison base
+        id: context
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REQUESTED_SCENARIO: ${{ inputs.scenario }}
+          BASE_BRANCH: ${{ github.base_ref }}
+          PUSH_BEFORE: ${{ github.event.before || '' }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch || 'main' }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          mode="${REQUESTED_SCENARIO:-changed}"
+          if [[ "$mode" != "changed" && "$mode" != "full" ]]; then
+            echo "Invalid scenario '$mode'; expected changed or full." >&2
+            exit 2
+          fi
+
+          if [[ "$EVENT_NAME" == "pull_request" && -n "$BASE_BRANCH" ]]; then
+            base="origin/$BASE_BRANCH"
+          elif [[ "$EVENT_NAME" == "push" && -n "$PUSH_BEFORE" && ! "$PUSH_BEFORE" =~ ^0+$ ]] \
+               && git cat-file -e "${PUSH_BEFORE}^{commit}" 2>/dev/null; then
+            base="$PUSH_BEFORE"
+          elif [[ "$EVENT_NAME" == "workflow_dispatch" && "$REF_NAME" == "$DEFAULT_BRANCH" ]] \
+               && git rev-parse --verify HEAD^ >/dev/null 2>&1; then
+            # Manual changed-only runs on the default branch compare the last commit to its parent.
+            base="HEAD^"
+          else
+            base="origin/$DEFAULT_BRANCH"
+          fi
+
+          git rev-parse --verify "${base}^{commit}" >/dev/null 2>&1 || {
+            echo "Unable to resolve comparison ref '$base'. Check checkout history and default branch." >&2
+            exit 1
+          }
+          echo "scenario=$mode" >> "$GITHUB_OUTPUT"
+          echo "base_ref=$base" >> "$GITHUB_OUTPUT"
+          echo "Scenario: $mode"
+          echo "Git comparison base: $base"
+
+      - name: Cache Eclipse PDE SDK
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/osgi-pde/eclipse-SDK-4.30
+          key: eclipse-pde-sdk-4.30-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Set up Eclipse PDE Build
+        id: pde
+        uses: Abhishek-6770/osgi-ci-platform/.github/actions/setup-eclipse-pde@main
+
+      - name: Validate OSGi manifests and package relationships
+        uses: Abhishek-6770/osgi-ci-platform/.github/actions/validate-osgi-metadata@main
+
+      - name: Test OSGi dependency planner
+        uses: Abhishek-6770/osgi-ci-platform/.github/actions/test-osgi-planner@main
+
+      - name: Plan dependency chain and generate graphs
+        id: plan
+        uses: Abhishek-6770/osgi-ci-platform/.github/actions/plan-osgi-build@main
+        with:
+          scenario: ${{ steps.context.outputs.scenario }}
+          base-ref: ${{ steps.context.outputs.base_ref }}
+          output-dir: target/osgi-smart-build
+
+      - name: Initialize CodeQL for Java (manual Eclipse PDE build)
+        if: steps.plan.outputs.full_build == 'true' || steps.plan.outputs.has_project_changes == 'true'
+        uses: github/codeql-action/init@v4
+        with:
+          languages: java-kotlin
+          build-mode: manual
+
+      - name: Build selected OSGi features using Eclipse PDE
+        id: pde-build
+        if: steps.plan.outputs.full_build == 'true' || steps.plan.outputs.has_project_changes == 'true'
+        uses: Abhishek-6770/osgi-ci-platform/.github/actions/build-osgi-pde@main
+        with:
+          eclipse-home: ${{ steps.pde.outputs.eclipse-home }}
+
+      - name: Analyze Java code with CodeQL
+        if: steps.plan.outputs.full_build == 'true' || steps.plan.outputs.has_project_changes == 'true'
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: /language:java-kotlin
+
+      - name: Report skipped changed-only build
+        if: steps.plan.outputs.full_build != 'true' && steps.plan.outputs.has_project_changes != 'true'
+        shell: bash
+        run: echo "No OSGi plug-in or feature changes were detected; PDE Build was skipped."
+
+      - name: Validate JFrog configuration
+        if: inputs.publish_to_jfrog && (steps.plan.outputs.full_build == 'true' || steps.plan.outputs.has_project_changes == 'true')
+        shell: bash
+        env:
+          JF_URL: ${{ vars.JF_URL }}
+          JF_GENERIC_REPO: ${{ vars.JF_GENERIC_REPO }}
+          JF_ACCESS_TOKEN: ${{ secrets.JF_ACCESS_TOKEN }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch || 'main' }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF_NAME" == "$DEFAULT_BRANCH" ]] || { echo "JFrog publishing is restricted to the default branch '$DEFAULT_BRANCH'." >&2; exit 2; }
+          [[ -n "$JF_URL" ]] || { echo "Repository variable JF_URL is required when publishing to JFrog." >&2; exit 2; }
+          [[ -n "$JF_GENERIC_REPO" ]] || { echo "Repository variable JF_GENERIC_REPO is required when publishing to JFrog." >&2; exit 2; }
+          [[ -n "$JF_ACCESS_TOKEN" ]] || { echo "Secret JF_ACCESS_TOKEN is required when publishing to JFrog." >&2; exit 2; }
+          [[ -d target/osgi-packages ]] || { echo "No OSGi package staging folder was generated." >&2; exit 2; }
+
+      - name: Publish OSGi bundles and build-info to JFrog Artifactory
+        if: inputs.publish_to_jfrog && (steps.plan.outputs.full_build == 'true' || steps.plan.outputs.has_project_changes == 'true')
+        uses: Abhishek-6770/osgi-ci-platform/.github/actions/publish-osgi-jfrog@main
+        with:
+          jfrog-url: ${{ vars.JF_URL }}
+          jfrog-access-token: ${{ secrets.JF_ACCESS_TOKEN }}
+          generic-repository: ${{ vars.JF_GENERIC_REPO }}
+          build-name: Northwind-OSGi
+          build-number: ${{ github.run_number }}
+
+      - name: Publish build report and artifacts
+        if: always()
+        uses: Abhishek-6770/osgi-ci-platform/.github/actions/publish-osgi-report@main
+        with:
+          artifact-name: osgi-pde-build-${{ github.run_number }}

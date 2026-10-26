@@ -1,0 +1,53 @@
+name: Publish OSGi packages to JFrog
+description: Upload generated OSGi bundle/feature archives and publish JFrog build-info
+inputs:
+  jfrog-url:
+    description: JFrog Platform URL, e.g. https://company.jfrog.io
+    required: true
+  jfrog-access-token:
+    description: JFrog access token supplied as a GitHub Actions secret
+    required: true
+  generic-repository:
+    description: Artifactory generic repository key (not a URL)
+    required: true
+  build-name:
+    description: JFrog build name
+    required: true
+  build-number:
+    description: JFrog build number
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Configure JFrog CLI
+      uses: jfrog/setup-jfrog-cli@v4
+      with:
+        disable-auto-build-publish: true
+      env:
+        JF_URL: ${{ inputs.jfrog-url }}
+        JF_ACCESS_TOKEN: ${{ inputs.jfrog-access-token }}
+        JFROG_CLI_BUILD_NAME: ${{ inputs.build-name }}
+        JFROG_CLI_BUILD_NUMBER: ${{ inputs.build-number }}
+        JFROG_CLI_LOG_TIMESTAMP: DATE_AND_TIME
+
+    - name: Upload OSGi artifacts and publish build-info
+      shell: bash
+      env:
+        JF_GENERIC_REPO: ${{ inputs.generic-repository }}
+        BUILD_NAME: ${{ inputs.build-name }}
+        BUILD_NUMBER: ${{ inputs.build-number }}
+      run: |
+        set -euo pipefail
+        [[ -d target/osgi-packages ]] || { echo "target/osgi-packages does not exist." >&2; exit 2; }
+        count="$(find target/osgi-packages -type f \( -name '*.jar' -o -name '*.zip' \) | wc -l | tr -d ' ')"
+        [[ "$count" -gt 0 ]] || { echo "No generated OSGi JAR/ZIP files to upload." >&2; exit 2; }
+        destination="${JF_GENERIC_REPO%/}/northwind-oms/${GITHUB_SHA}/"
+        echo "Uploading $count OSGi artifacts to $destination"
+        jf rt ping
+        jf rt upload "target/osgi-packages/**" "$destination" \
+          --recursive=true --flat=false \
+          --build-name "$BUILD_NAME" --build-number "$BUILD_NUMBER"
+        jf rt build-collect-env "$BUILD_NAME" "$BUILD_NUMBER"
+        jf rt build-add-git "$BUILD_NAME" "$BUILD_NUMBER"
+        jf rt build-publish "$BUILD_NAME" "$BUILD_NUMBER"
+        echo "JFrog build-info published: $BUILD_NAME / $BUILD_NUMBER"

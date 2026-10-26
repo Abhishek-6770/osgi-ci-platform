@@ -1,0 +1,8 @@
+name: Validate OSGi Metadata
+description: Validate bundle identity, package imports/exports, feature contents, and internal dependency resolution
+runs:
+  using: composite
+  steps:
+    - name: Validate MANIFEST.MF and feature.xml relationships
+      shell: bash
+      run: node "$GITHUB_ACTION_PATH/validate-osgi-metadata.mjs"

@@ -1,0 +1,58 @@
+name: Promote OSGi Build in JFrog
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_name:
+        description: Exact JFrog build-info name used during upload (default Northwind-OSGi)
+        type: string
+        default: Northwind-OSGi
+        required: true
+      build_number:
+        description: GitHub Actions run number used when publishing build-info
+        type: string
+        required: true
+      target_repository:
+        description: Destination Artifactory repository for the promoted build
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  promote:
+    name: Promote previously validated OSGi artifacts
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - name: Validate JFrog configuration
+        shell: bash
+        env:
+          JF_URL: ${{ vars.JF_URL }}
+          JF_ACCESS_TOKEN: ${{ secrets.JF_ACCESS_TOKEN }}
+          TARGET_REPOSITORY: ${{ inputs.target_repository }}
+        run: |
+          set -euo pipefail
+          [[ -n "$JF_URL" ]] || { echo "Repository variable JF_URL is required." >&2; exit 2; }
+          [[ -n "$JF_ACCESS_TOKEN" ]] || { echo "Secret JF_ACCESS_TOKEN is required." >&2; exit 2; }
+          [[ "$TARGET_REPOSITORY" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "Invalid Artifactory repository key." >&2; exit 2; }
+
+      - name: Configure JFrog CLI
+        uses: jfrog/setup-jfrog-cli@v4
+        env:
+          JF_URL: ${{ vars.JF_URL }}
+          JF_ACCESS_TOKEN: ${{ secrets.JF_ACCESS_TOKEN }}
+
+      - name: Promote build-info and associated artifacts
+        shell: bash
+        env:
+          BUILD_NAME: ${{ inputs.build_name }}
+          BUILD_NUMBER: ${{ inputs.build_number }}
+          TARGET_REPOSITORY: ${{ inputs.target_repository }}
+        run: |
+          set -euo pipefail
+          echo "Promoting JFrog build '$BUILD_NAME' #$BUILD_NUMBER to '$TARGET_REPOSITORY'"
+          jf rt ping
+          jf rt build-promote "$BUILD_NAME" "$BUILD_NUMBER" "$TARGET_REPOSITORY" --copy=true
+          echo "Promotion completed. Review Artifactory audit/build-info history for the result."

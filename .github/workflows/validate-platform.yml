@@ -1,0 +1,27 @@
+name: Validate CI Platform
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate-javascript:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out centralized actions
+        uses: actions/checkout@v7
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+      - name: Validate action JavaScript syntax
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --check .github/actions/plan-osgi-build/osgi-smart-build.mjs
+          node --check .github/actions/validate-osgi-metadata/validate-osgi-metadata.mjs
+          node --check .github/actions/test-osgi-planner/osgi-smart-build.test.mjs

@@ -1,0 +1,130 @@
+name: Build OSGi Features with PDE
+description: Run Eclipse PDE headless builds for selected product features in dependency order
+inputs:
+  eclipse-home:
+    description: Path to the Eclipse SDK containing org.eclipse.pde.build
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Stage source plug-ins and features
+      shell: bash
+      run: |
+        set -euo pipefail
+        workspace="$GITHUB_WORKSPACE/target/pde-workspace"
+        rm -rf "$workspace"
+        mkdir -p "$workspace/plugins" "$workspace/features"
+
+        while IFS= read -r -d '' project; do
+          [[ -f "$project/META-INF/MANIFEST.MF" ]] || continue
+          target="$workspace/plugins/$(basename "$project")"
+          echo "Staging plug-in: $project"
+          cp -a "$project" "$target"
+        done < <(find . -mindepth 3 -maxdepth 3 -type d -path './*/plugins/*' -print0)
+
+        while IFS= read -r -d '' feature; do
+          [[ -f "$feature/feature.xml" ]] || continue
+          target="$workspace/features/$(basename "$feature")"
+          echo "Staging feature: $feature"
+          cp -a "$feature" "$target"
+        done < <(find . -mindepth 3 -maxdepth 3 -type d -path './*/features/*' -print0)
+
+        plugin_count="$(find "$workspace/plugins" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')"
+        feature_count="$(find "$workspace/features" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')"
+        echo "PDE workspace: $workspace"
+        echo "Staged plug-ins: $plugin_count"
+        echo "Staged features: $feature_count"
+        [[ "$plugin_count" -gt 0 && "$feature_count" -gt 0 ]] || {
+          echo "No PDE plug-ins/features found at repository root. Expected <product>/plugins and <product>/features." >&2
+          exit 1
+        }
+
+    - name: Build selected product features in dependency order
+      shell: bash
+      env:
+        ECLIPSE_HOME: ${{ inputs.eclipse-home }}
+      run: |
+        set -euo pipefail
+        plan="$GITHUB_WORKSPACE/target/osgi-smart-build/plan.json"
+        workspace="$GITHUB_WORKSPACE/target/pde-workspace"
+        config_root="$RUNNER_TEMP/pde-build-config"
+        mkdir -p "$config_root"
+        test -f "$plan"
+
+        pde_plugin="$(find "$ECLIPSE_HOME/plugins" -maxdepth 1 -type d -name 'org.eclipse.pde.build_*' | sort -V | tail -n 1)"
+        launcher="$(find "$ECLIPSE_HOME/plugins" -maxdepth 1 -type f -name 'org.eclipse.equinox.launcher_*.jar' | sort -V | tail -n 1)"
+        template="$pde_plugin/templates/headless-build/build.properties"
+        test -f "$pde_plugin/scripts/build.xml"
+        test -f "$template"
+        test -f "$launcher"
+
+        full_build="$(node -e "process.stdout.write(require('./target/osgi-smart-build/plan.json').fullBuild ? 'true' : 'false')")"
+        if [[ "$full_build" == "true" ]]; then
+          mapfile -t products < <(node -e "console.log(require('./target/osgi-smart-build/plan.json').fullOrder.join('\\n'))")
+          echo "Build mode: FULL"
+        else
+          mapfile -t products < <(node -e "console.log(require('./target/osgi-smart-build/plan.json').changedOrder.join('\\n'))")
+          echo "Build mode: CHANGED ONLY"
+        fi
+
+        sequence=0
+        for product in "${products[@]}"; do
+          [[ -n "$product" ]] || continue
+          sequence=$((sequence + 1))
+          feature_xml="$(find "$GITHUB_WORKSPACE/$product/features" -mindepth 2 -maxdepth 2 -type f -name feature.xml -print -quit 2>/dev/null || true)"
+          if [[ -z "$feature_xml" ]]; then
+            echo "ERROR: no feature.xml found under '$product/features'." >&2
+            exit 1
+          fi
+          feature_id="$(node -e 'const fs=require("fs"); const xml=fs.readFileSync(process.argv[1],"utf8"); const id=xml.match(/<feature\b[\s\S]*?\bid=["\x27]([^"\x27]+)/)?.[1]; if(!id) process.exit(1); process.stdout.write(id)' "$feature_xml" || true)"
+          if [[ -z "$feature_id" ]]; then
+            echo "ERROR: unable to read feature id from $feature_xml" >&2
+            exit 1
+          fi
+
+          config="$config_root/$product"
+          mkdir -p "$config"
+          cp "$template" "$config/build.properties"
+          printf '\n# Northwind OMS values supplied by the reusable GitHub Actions pipeline\nbaseLocation=%s\nbuildDirectory=%s\ntopLevelElementType=feature\ntopLevelElementId=%s\nconfigs=*,*,*\narchivePrefix=northwind-oms-%s\nbuildLabel=%s-%s\n' \
+            "$ECLIPSE_HOME" "$workspace" "$feature_id" "$product" "$product" "${GITHUB_RUN_NUMBER:-local}" \
+            >> "$config/build.properties"
+
+          echo ""
+          echo "============================================================"
+          echo "PDE build $sequence/${#products[@]}: product=$product feature=$feature_id"
+          echo "Engine: Eclipse PDE Build / Ant (Maven is not used)"
+          echo "============================================================"
+          java -jar "$launcher" \
+            -application org.eclipse.ant.core.antRunner \
+            -buildfile "$pde_plugin/scripts/build.xml" \
+            -Dbuilder="$config" \
+            -nosplash
+        done
+
+        if [[ "$sequence" -eq 0 ]]; then
+          echo "The plan did not select any product features; no PDE build was needed."
+        fi
+
+        # PDE emits packaged bundles/features beneath its generated I.<buildLabel> outputs.
+        # Stage only generated archive files (not source bundle folders or embedded libraries).
+        package_dir="$GITHUB_WORKSPACE/target/osgi-packages"
+        rm -rf "$package_dir"
+        mkdir -p "$package_dir"
+        while IFS= read -r -d '' artifact; do
+          relative="${artifact#"$workspace"/}"
+          destination="$package_dir/$relative"
+          mkdir -p "$(dirname "$destination")"
+          cp "$artifact" "$destination"
+          echo "Packaged OSGi artifact: $relative"
+        done < <(find "$workspace" -type f \
+          \( -path '*/plugins/*.jar' -o -path '*/features/*.jar' -o -name '*.zip' \) \
+          -not -path "$workspace/plugins/*" -not -path "$workspace/features/*" -print0)
+
+        if [[ "$sequence" -gt 0 ]] && ! find "$package_dir" -type f \( -name '*.jar' -o -name '*.zip' \) -print -quit | grep -q .; then
+          echo "PDE ran, but no packaged JAR/ZIP outputs were found under $workspace." >&2
+          echo "Check the PDE build log and the selected feature's build.properties." >&2
+          exit 1
+        fi
+
+        echo "Final OSGi package inventory:"
+        find "$package_dir" -type f -printf '  %P (%s bytes)\n' | sort

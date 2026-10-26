@@ -1,0 +1,46 @@
+name: Plan OSGi Build
+description: Detect changed OSGi projects, compute dependent products and draw dependency graphs
+inputs:
+  scenario:
+    description: full or changed
+    required: false
+    default: changed
+  base-ref:
+    description: Git ref used to find changed files
+    required: true
+  output-dir:
+    description: Directory for plan JSON, report and dependency graphs
+    required: false
+    default: target/osgi-smart-build
+outputs:
+  full_build:
+    description: true when all products must be built
+    value: ${{ steps.plan.outputs.full_build }}
+  has_project_changes:
+    description: true when one or more OSGi projects changed
+    value: ${{ steps.plan.outputs.has_project_changes }}
+  selected_projects:
+    description: Comma-separated changed OSGi project paths
+    value: ${{ steps.plan.outputs.selected_projects }}
+  changed_products:
+    description: Comma-separated products changed directly
+    value: ${{ steps.plan.outputs.changed_products }}
+  affected_products:
+    description: Comma-separated products selected for dependent rebuild
+    value: ${{ steps.plan.outputs.affected_products }}
+runs:
+  using: composite
+  steps:
+    - name: Create dependency plan and graph files
+      id: plan
+      shell: bash
+      env:
+        SCENARIO: ${{ inputs.scenario }}
+        BASE_REF: ${{ inputs.base-ref }}
+        OUTPUT_DIR: ${{ inputs.output-dir }}
+      run: |
+        set -euo pipefail
+        node "$GITHUB_ACTION_PATH/osgi-smart-build.mjs" \
+          --scenario "$SCENARIO" \
+          --base "$BASE_REF" \
+          --output "$OUTPUT_DIR"

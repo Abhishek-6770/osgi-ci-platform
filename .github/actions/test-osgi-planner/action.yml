@@ -1,0 +1,10 @@
+name: Test OSGi Planner
+description: Run the centralized OSGi dependency planner's checks against the calling product repository
+runs:
+  using: composite
+  steps:
+    - name: Run planner tests against the caller repository
+      shell: bash
+      env:
+        OSGI_PROJECT_ROOT: ${{ github.workspace }}
+      run: node --test "$GITHUB_ACTION_PATH/osgi-smart-build.test.mjs"

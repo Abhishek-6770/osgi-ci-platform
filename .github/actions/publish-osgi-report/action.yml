@@ -1,0 +1,31 @@
+name: Publish OSGi Report
+description: Add the build report to the GitHub summary and upload graphs, plan and PDE outputs
+inputs:
+  artifact-name:
+    description: Name of the uploaded artifact
+    required: false
+    default: osgi-pde-build-report
+runs:
+  using: composite
+  steps:
+    - name: Add report to job summary
+      if: always()
+      shell: bash
+      run: |
+        if [[ -f target/osgi-smart-build/report.md ]]; then
+          cat target/osgi-smart-build/report.md >> "$GITHUB_STEP_SUMMARY"
+        else
+          echo "The OSGi build report was not generated." >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+    - name: Upload PDE output, dependency graphs and report
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{ inputs.artifact-name }}
+        path: |
+          target/pde-workspace/
+          target/osgi-packages/
+          target/osgi-smart-build/
+        if-no-files-found: warn
+        retention-days: 14
