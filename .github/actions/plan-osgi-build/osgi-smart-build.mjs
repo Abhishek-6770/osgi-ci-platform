@@ -194,6 +194,24 @@ export function affectedDependents(model, changedProducts) {
   return selected;
 }
 
+function includePrerequisites(model, products) {
+  const selected = new Set(products);
+  const queue = [...selected];
+
+  while (queue.length) {
+    const product = queue.shift();
+
+    for (const dependency of model.dependencies.get(product) ?? []) {
+      if (!selected.has(dependency)) {
+        selected.add(dependency);
+        queue.push(dependency);
+      }
+    }
+  }
+
+  return selected;
+}
+
 export function allDependencyPaths(model, changedProducts) {
   const reverse = new Map(model.modules.map(name => [name, []]));
   for (const [dependency, dependent] of model.edges) reverse.get(dependency).push(dependent);
@@ -317,11 +335,14 @@ export function createPlan(root, options = {}) {
   const fullOrder = buildOrder(model);
   const changedOrder = buildOrder(model, affectedProducts);
   const fullBuild = scenario === 'full' || classified.globalPaths.length > 0;
+  const executionSet = fullBuild ? new Set(model.modules) : includePrerequisites(model, affectedProducts);
+  const executionOrder = buildOrder(model, executionSet);
+  const prerequisiteProducts = model.modules.filter(name => executionSet.has(name) && !affectedProducts.has(name));
   return {
-    scenario, fullBuild, changedPaths, changedProducts: model.modules.filter(m => classified.changedProducts.has(m)),
+    scenario, fullBuild, changedPaths, prerequisiteProducts, changedProducts: model.modules.filter(m => classified.changedProducts.has(m)),
     affectedProducts: model.modules.filter(m => affectedProducts.has(m)),
     changedProjects: classified.changedProjects, globalPaths: classified.globalPaths,
-    ignoredPaths: classified.ignoredPaths, fullOrder, changedOrder, edges: model.edges,
+    ignoredPaths: classified.ignoredPaths, fullOrder, changedOrder, executionOrder, edges: model.edges,
     dependencyPaths: allDependencyPaths(model, classified.changedProducts), model,
   };
 }
