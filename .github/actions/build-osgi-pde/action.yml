@@ -85,7 +85,7 @@ runs:
           config="$config_root/$product"
           mkdir -p "$config"
           cp "$template" "$config/build.properties"
-          printf '\n# Northwind OMS values supplied by the reusable GitHub Actions pipeline\nbaseLocation=%s\nbuildDirectory=%s\ntopLevelElementType=feature\ntopLevelElementId=%s\nconfigs=*,*,*\narchivePrefix=northwind-oms-%s\nbuildLabel=%s-%s\n' \
+          printf '\n# Northwind OMS values supplied by the reusable GitHub Actions pipeline\nbaseLocation=%s\nbuildDirectory=%s\njavacSource=17\njavacTarget=17\njavacFailOnError=true\ntopLevelElementType=feature\ntopLevelElementId=%s\nconfigs=*,*,*\narchivePrefix=northwind-oms-%s\nbuildLabel=%s-%s\n' \
             "$ECLIPSE_HOME" "$workspace" "$feature_id" "$product" "$product" "${GITHUB_RUN_NUMBER:-local}" \
             >> "$config/build.properties"
 
