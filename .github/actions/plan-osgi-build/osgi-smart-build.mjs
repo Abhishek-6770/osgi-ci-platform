@@ -430,7 +430,7 @@ async function main() {
   fs.writeFileSync(path.join(outputDir, 'plan.json'), JSON.stringify({
     scenario: plan.scenario, fullBuild: plan.fullBuild, changedPaths: plan.changedPaths,
     changedProducts: plan.changedProducts, affectedProducts: plan.affectedProducts,
-    changedProjects: plan.changedProjects, fullOrder: plan.fullOrder, changedOrder: plan.changedOrder,
+    changedProjects: plan.changedProjects, fullOrder: plan.fullOrder, changedOrder: plan.changedOrder, executionOrder: plan.executionOrder,
     dependencyPaths: plan.dependencyPaths, edges: plan.edges, globalPaths: plan.globalPaths, ignoredPaths: plan.ignoredPaths,
   }, null, 2));
 
