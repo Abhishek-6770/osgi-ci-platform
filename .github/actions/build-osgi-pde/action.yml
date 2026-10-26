@@ -63,7 +63,7 @@ runs:
           mapfile -t products < <(node -e "console.log(require('./target/osgi-smart-build/plan.json').fullOrder.join('\\n'))")
           echo "Build mode: FULL"
         else
-          mapfile -t products < <(node -e "console.log(require('./target/osgi-smart-build/plan.json').changedOrder.join('\\n'))")
+          mapfile -t products < <(node -e "console.log(require('./target/osgi-smart-build/plan.json').executionOrder.join('\\n'))")
           echo "Build mode: CHANGED ONLY"
         fi
 
