@@ -76,6 +76,7 @@ runs:
         process.stdout.write(plan.fullBuild ? 'true' : 'false');
         NODE
         )"
+
         mapfile -t all_products < <(node - "$plan" <<'NODE'
         const fs = require('node:fs');
         const plan = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
@@ -83,6 +84,7 @@ runs:
         console.log(plan.fullOrder.join('\n'));
         NODE
         )
+
         mapfile -t changed_order < <(node - "$plan" <<'NODE'
         const fs = require('node:fs');
         const plan = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
@@ -90,6 +92,7 @@ runs:
         if (plan.changedOrder.length) console.log(plan.changedOrder.join('\n'));
         NODE
         )
+
         mapfile -t affected_products < <(node - "$plan" <<'NODE'
         const fs = require('node:fs');
         const plan = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
@@ -98,13 +101,14 @@ runs:
         NODE
         )
 
-        # The cache is valid only if a successful build previously stored a bundle for each product.
+        # Check that a successful build previously stored bundles for every product.
         baseline_ready=true
         [[ -f "$baseline/.complete" ]] || baseline_ready=false
+
         if [[ "$baseline_ready" == "true" ]]; then
           for product in "${all_products[@]}"; do
             if [[ ! -d "$baseline/$product/plugins" ]] || ! find "$baseline/$product/plugins" -maxdepth 1 -type f -name '*.jar' -print -quit | grep -q .; then
-              echo "Cached baseline is incomplete for product '$product'; falling back to prerequisite builds."
+              echo "Cached baseline is incomplete for product '$product'; falling back to a full build."
               baseline_ready=false
               break
             fi
@@ -124,5 +128,158 @@ runs:
           echo "Build mode: CHANGED ONLY (cached prerequisites available)"
           echo "The build will compile only changed products and downstream dependents."
         else
-          # A cold cache must produce a complete baseline. Building only the current dependency closure
-          # could leave other products absent from the cache and force repeated cold starts later.
+          # A cold cache must produce a complete baseline.
+          # Bootstrap it with all products so subsequent runs can use cached prerequisites.
+          products=("${all_products[@]}")
+          echo "Build mode: CHANGED ONLY requested, but baseline cache is cold/incomplete."
+          echo "Bootstrapping the reusable baseline with one full PDE build."
+        fi
+
+        # Make cached binaries for unaffected products available to PDE.
+        # Never use stale cached binaries for products being rebuilt.
+        baseline_plugin_path=""
+        if [[ "$baseline_ready" == "true" && "$full_build" != "true" && "${#products[@]}" -gt 0 ]]; then
+          unaffected_roots=()
+          for candidate in "${all_products[@]}"; do
+            is_affected=false
+            for affected in "${affected_products[@]}"; do
+              [[ "$candidate" == "$affected" ]] && is_affected=true && break
+            done
+            [[ "$is_affected" == "true" ]] && continue
+
+            if find "$baseline/$candidate/plugins" -maxdepth 1 -type f -name '*.jar' -print -quit | grep -q .; then
+              unaffected_roots+=("$baseline/$candidate")
+            fi
+          done
+
+          if [[ "${#unaffected_roots[@]}" -gt 0 ]]; then
+            baseline_plugin_path="$(IFS=:; printf '%s' "${unaffected_roots[*]}")"
+          fi
+          echo "Cached prerequisite products available to PDE: ${unaffected_roots[*]:-(none)}"
+        fi
+
+        sequence=0
+        for product in "${products[@]}"; do
+          [[ -n "$product" ]] || continue
+          sequence=$((sequence + 1))
+
+          feature_xml="$(find "$GITHUB_WORKSPACE/$product/features" -mindepth 2 -maxdepth 2 -type f -name feature.xml -print -quit 2>/dev/null || true)"
+          if [[ -z "$feature_xml" ]]; then
+            echo "ERROR: no feature.xml found under '$product/features'." >&2
+            exit 1
+          fi
+
+          feature_id="$(node -e 'const fs=require("node:fs"); const xml=fs.readFileSync(process.argv[1],"utf8"); const id=xml.match(/<feature\b[^>]*\bid\s*=\s*["\x27]([^"\x27]+)/s)?.[1]; if(!id) process.exit(1); process.stdout.write(id)' "$feature_xml" || true)"
+          if [[ -z "$feature_id" ]]; then
+            echo "ERROR: unable to read feature id from $feature_xml" >&2
+            exit 1
+          fi
+
+          config="$config_root/$product"
+          mkdir -p "$config"
+          cp "$template" "$config/build.properties"
+
+          printf '\n# Northwind OMS values supplied by the reusable GitHub Actions pipeline\nbaseLocation=%s\nbuildDirectory=%s\njavacSource=17\njavacTarget=17\njavacFailOnError=true\ntopLevelElementType=feature\ntopLevelElementId=%s\nconfigs=*,*,*\narchivePrefix=northwind-oms-%s\nbuildLabel=%s-%s\n' \
+            "$ECLIPSE_HOME" "$workspace" "$feature_id" "$product" "$product" "${GITHUB_RUN_NUMBER:-local}" \
+            >> "$config/build.properties"
+
+          if [[ -n "$baseline_plugin_path" ]]; then
+            printf 'pluginPath=%s\n' "$baseline_plugin_path" >> "$config/build.properties"
+          fi
+
+          echo ""
+          echo "============================================================"
+          echo "PDE build $sequence/${#products[@]}: product=$product feature=$feature_id"
+          echo "Engine: Eclipse PDE Build / Ant (Maven is not used)"
+          [[ -n "$baseline_plugin_path" ]] && echo "Using cached target-platform bundles for unchanged prerequisites."
+          echo "============================================================"
+
+          java -jar "$launcher" \
+            -application org.eclipse.ant.core.antRunner \
+            -buildfile "$pde_plugin/scripts/build.xml" \
+            -Dbuilder="$config" \
+            -nosplash
+
+          # Extract plug-in/feature JARs from the generated PDE feature archive.
+          archive="$(find "$workspace" -maxdepth 3 -type f -path "$workspace/${product}-*/*.zip" ! -name '*.log.zip' -print | sort | tail -n 1)"
+          if [[ -z "$archive" ]]; then
+            echo "ERROR: PDE succeeded but no generated feature archive was found for '$product'." >&2
+            exit 1
+          fi
+
+          tmp_extract="$(mktemp -d)"
+          unzip -q "$archive" -d "$tmp_extract"
+          product_cache="$baseline/$product"
+          rm -rf "$product_cache"
+          mkdir -p "$product_cache/plugins" "$product_cache/features"
+
+          while IFS= read -r -d '' bundle; do
+            cp "$bundle" "$product_cache/plugins/$(basename "$bundle")"
+          done < <(find "$tmp_extract" -type f -path '*/plugins/*.jar' -print0)
+
+          while IFS= read -r -d '' feature; do
+            cp "$feature" "$product_cache/features/$(basename "$feature")"
+          done < <(find "$tmp_extract" -type f -path '*/features/*.jar' -print0)
+
+          rm -rf "$tmp_extract"
+
+          if ! find "$product_cache/plugins" -maxdepth 1 -type f -name '*.jar' -print -quit | grep -q .; then
+            echo "ERROR: no plug-in JARs were extracted from '$archive' for product '$product'." >&2
+            echo "Archive contents:" >&2
+            unzip -Z1 "$archive" | head -n 80 >&2 || true
+            exit 1
+          fi
+
+          echo "Refreshed cached prerequisite bundles for '$product' from $(basename "$archive")"
+        done
+
+        # Mark the cache complete only after every product has a usable bundle.
+        baseline_complete=true
+        for product in "${all_products[@]}"; do
+          if [[ ! -d "$baseline/$product/plugins" ]] || ! find "$baseline/$product/plugins" -maxdepth 1 -type f -name '*.jar' -print -quit | grep -q .; then
+            baseline_complete=false
+            echo "Baseline not yet complete: no cached bundle JAR for '$product'."
+            break
+          fi
+        done
+
+        if [[ "$baseline_complete" == "true" ]]; then
+          printf '%s\n' "${all_products[@]}" > "$baseline/.complete"
+          echo "Complete PDE baseline cache now contains all ${#all_products[@]} product domains."
+          echo "baseline_complete=true" >> "$GITHUB_OUTPUT"
+        fi
+
+        if [[ "$sequence" -eq 0 ]]; then
+          echo "No PDE feature builds were required."
+        fi
+
+        # Stage generated archive files as workflow artifacts.
+        package_dir="$GITHUB_WORKSPACE/target/osgi-packages"
+        rm -rf "$package_dir"
+        mkdir -p "$package_dir"
+
+        while IFS= read -r -d '' artifact; do
+          relative="${artifact#"$workspace"/}"
+          destination="$package_dir/$relative"
+          mkdir -p "$(dirname "$destination")"
+          cp "$artifact" "$destination"
+          echo "Packaged OSGi artifact: $relative"
+        done < <(find "$workspace" -type f \
+          \( -path '*/plugins/*.jar' -o -path '*/features/*.jar' -o -name '*.zip' \) \
+          -not -path "$workspace/plugins/*" -not -path "$workspace/features/*" -print0)
+
+        if [[ "$sequence" -gt 0 ]] && ! find "$package_dir" -type f \( -name '*.jar' -o -name '*.zip' \) -print -quit | grep -q .; then
+          echo "PDE ran, but no packaged JAR/ZIP outputs were found under $workspace." >&2
+          echo "Check the PDE build log and the selected feature's build.properties." >&2
+          exit 1
+        fi
+
+        echo "Final OSGi package inventory:"
+        find "$package_dir" -type f -printf '  %P (%s bytes)\n' | sort
+
+    - name: Save refreshed OSGi baseline cache
+      if: ${{ success() && steps.restore-baseline.outputs.cache-hit != 'true' && steps.build-pde.outputs.baseline_complete == 'true' }}
+      uses: actions/cache/save@v6
+      with:
+        path: target/osgi-pde-baseline
+        key: osgi-pde-baseline-v1-${{ runner.os }}-eclipse-4.30-jdk17-${{ hashFiles('catalog/**', 'customer/**', 'notification/**', 'orders/**', 'payment/**', 'reporting/**', 'security/**', 'shipping/**', 'thirdparty/**', 'build.xml', 'build.properties', 'pde-build/**') }}
